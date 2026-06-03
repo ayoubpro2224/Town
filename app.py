@@ -1,45 +1,63 @@
 from flask import Flask, request, send_file
-import lz4.frame
 import io
+import struct
 
 app = Flask(__name__)
 
-def generate_table(param2, param3):
+# دالة توليد الجدول كما في hash.cpp
+def generate_hash_table(length, seed):
     table = bytearray(727)
-    iVar3 = 0
-    while iVar3 < 727:
-        uVar2 = 726 - iVar3
-        uVar1 = ((param3 * 0x5bd1e995 ^ (param3 * 0x5bd1e995 >> 24)) * 0x5bd1e995 ^ ((param2 ^ 4) * 0x5bd1e995)) & 0xFFFFFFFF
-        uVar1 = ((uVar1 ^ (uVar1 >> 13)) * 0x5bd1e995) & 0xFFFFFFFF
-        param3 = (uVar1 ^ (uVar1 >> 15)) & 0xFFFFFFFF
-        if uVar2 > 2: uVar2 = 3
+    i = 0
+    hash_val = seed
+    # محاكاة منطق MurmurHash2 للقيم (كما في كود C)
+    m = 0x5bd1e995
+    while i < 727:
+        # هذه محاكاة منطقية للحلقة الموجودة في الكود الأصلي
+        h = hash_val
+        k = (h * m) & 0xFFFFFFFF
+        k = (k ^ (k >> 24)) * m
+        hash_val = (k ^ (k >> 13)) * m
+        hash_val = (hash_val ^ (hash_val >> 15)) & 0xFFFFFFFF
         
-        chunk = param3.to_bytes(4, 'little')
-        for k in range(uVar2 + 1):
-            table[iVar3 + k] = chunk[k]
-        iVar3 += uVar2 + 1
+        # محاكاة memcpy
+        chunk = hash_val.to_bytes(4, 'little')
+        for j in range(4):
+            if i + j < 727:
+                table[i + j] = chunk[j]
+        i += 4
     return table
 
-@app.route('/', methods=['GET', 'POST'])
+@app.route('/', methods=['POST'])
 def decrypt():
-    if request.method == 'POST':
-        file = request.files['file']
-        data = file.read()
+    if 'file' not in request.files:
+        return "لا يوجد ملف مرفوع"
+    
+    file = request.files['file']
+    raw_data = bytearray(file.read())
+    
+    # 1. استخراج الـ Header (8 بايت كما في data.h)
+    # TOWNSHIP_XML_HEADER
+    header = raw_data[:8]
+    # قراءة hash_seed (البايتات 4 إلى 8)
+    _, _, hash_seed = struct.unpack('<BI I', header) 
+    
+    # 2. البيانات الفعلية (بعد 8 بايت)
+    body_data = raw_data[8:]
+    
+    # 3. توليد الجدول (بناءً على البذرة)
+    table = generate_hash_table(727, hash_seed + 4)
+    
+    # 4. فك التشفير التراكمي (Delta Decoding + XOR)
+    size = len(body_data)
+    for i in range(size):
+        j = i % 727
+        # عكس عملية التراكم (C: -= تصبح في الفك +=)
+        if i > 0:
+            body_data[i] = (body_data[i] + body_data[i-1]) & 0xFF
+        # عكس الـ XOR (هو نفسه)
+        body_data[i] = (body_data[i] ^ table[j]) & 0xFF
         
-        # فك التشفير
-        table = generate_table(0x1, 0x2)
-        decrypted = bytearray(len(data))
-        for i in range(len(data)):
-            decrypted[i] = data[i] ^ table[i % 727] ^ 0x79
-            
-        # فك الضغط (LZ4)
-        try:
-            decompressed = lz4.frame.decompress(decrypted)
-            return send_file(io.BytesIO(decompressed), download_name="decrypted.xml", mimetype="application/xml")
-        except:
-            return "خطأ في فك الضغط، ربما الترويسة تحتاج حذف!"
-            
-    return '''<form method="post" enctype="multipart/form-data"><input type="file" name="file"><input type="submit"></form>'''
+    return send_file(io.BytesIO(body_data), download_name="decoded.xml", mimetype="application/xml")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
